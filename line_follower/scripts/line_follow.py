@@ -9,7 +9,7 @@ from geometry_msgs.msg import Twist
 class LineFollower(object)
     def __init__(self):
         self.bridge = CvBridge()
-        #placeholder
+        # placeholder until we figure out a way/topic to publish our camera feed
         #self.image_sub = rospy.Subscriber("/vid_feed", Image, self.camera_callback)
         # dictionary of 4 cardinal directions and one stop for line follow task
         self.right = Twist()
@@ -36,7 +36,7 @@ class LineFollower(object)
         except CvBridgeError as e:
             print(e)
 
-        # downsampling to 212 x 80 to speed things up
+        # downsampling to 212 x 160 to speed things up
         newsize = (212, 160)
         interpolation = cv2.INTER_NEAREST
         resized_img = cv2.resize(image, newsize, 0, 0, interpolation)
