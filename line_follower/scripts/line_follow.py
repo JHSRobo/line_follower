@@ -11,7 +11,7 @@ class LineFollower:
     def __init__(self):
         self.bridge = CvBridge()
         # figure out the video feed
-        self.image_sub = rospy.Subscriber("/vid_feed", Image, self.camera_callback)
+        self.image_sub = rospy.Subscriber("/rov/image_raw", Image, self.camera_callback)
         self.movement_pub = rospy.Publisher("/rov/cmd_vel", Twist, 0)
         # dictionary of 4 cardinal directions and one stop for line follow task
         self.right = Twist()
