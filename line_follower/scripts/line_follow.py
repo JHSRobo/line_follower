@@ -110,7 +110,7 @@ class LineFollower:
                 self.other_err = self.x_err
                 self.err_axis = 'y'
                 self.other_axis = 'x'
-        elif -self.threshold < self.other_err < self.threshold:
+        elif not (-self.threshold < self.other_err < self.threshold):
             self.largest_err = self.other_err
             self.err_axis = self.other_axis
         self.direction_msg = self.makeDirectionMessage(largest_err, err_axis)
