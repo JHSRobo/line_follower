@@ -39,6 +39,7 @@ class LineFollower:
         self.largest_err = 0
         self.other_err = 0
         self.err_axis = ''
+        self.other_axis = ''
 
     def makeDirectionMessage(self, axis, error):
         try:
@@ -99,19 +100,20 @@ class LineFollower:
 
         # TODO sanity check this
         if self.prev_direction[0] is not 'x' or self.prev_direction[0] is not 'y':
-            if abs(x_err) > abs(y_err) and (self.prev_direction[0] is not 'x' or x_err / abs(x_err) is not self.prev_direction[1]):
+            if abs(x_err) > abs(y_err):
                 self.largest_err = self.x_err
                 self.other_err = self.y_err
                 self.err_axis = 'x'
-                self.direction_msg = self.makeDirectionMessage(largest_err, err_axis)
-            elif self.prev_direction[0] is not 'y' or y_err / abs(y_err) is not self.prev_direction[1]:
+                self.other_axis = 'y'
+            else:
                 self.largest_err = self.y_err
                 self.other_err = self.x_err
                 self.err_axis = 'y'
-                self.direction_msg = self.makeDirectionMessage(largest_err, err_axis)
-            else:
-                self.direction_msg = self.stop
-                self.prev_direction = ['', '']
+                self.other_axis = 'x'
+        elif -self.threshold < self.other_err < self.threshold:
+            self.largest_err = self.other_err
+            self.err_axis = self.other_axis
+        self.direction_msg = self.makeDirectionMessage(largest_err, err_axis)
         movement_pub.publish(self.keepCentered(self.other_err, self.err_axis))
 
 def main():
