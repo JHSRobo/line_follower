@@ -24,6 +24,13 @@ class LineFollower:
         self.down = Twist()
         self.stop = Twist()
 
+        # rough relationship between horizontal and vertical thrust
+        # as well as forward and back
+        self.baseThrust = 0.12
+        self.reverseConstant = 1.5 # forward thrust is about 1.5x as powerful as reverse with the same cmd_vel
+        self.upwardThrustRatio = math.sqrt(2) + (1/self.reverseConstant) * math.sqrt(2)
+        self.downwardThrustRatio = math.sqrt(2) + self.reverseConstant * math.sqrt(2)
+
         # for picking which direction message to use
         # axes of an image increase left to right and bottom to top
         self.y_directions = {1 : self.down, -1 : self.up}
@@ -34,8 +41,8 @@ class LineFollower:
         # for software PD controller (no integral)
         self.prev_err = 0
         self.prev_time = rospy.Time.now()
-        self.kP = 0.002
-        self.kD = 0
+        self.kP = 0.003
+        self.kD = 0.002
 
         # for choosing directions
         # [axis ('x' or 'y'), direction (1 or -1)]
@@ -50,8 +57,8 @@ class LineFollower:
         self.borderWidth = 30
 
         # preprocessing parameters
-        self.height = 160
-        self.width = 160
+        self.height = 212
+        self.width = 212
 
         # for deciding when to end line following
         self.start_time = rospy.Time.now().to_sec()
@@ -65,10 +72,10 @@ class LineFollower:
         self.longestLine = [0,0,0,0]
 
     def resetMessages(self):
-        self.right.linear.x = 0.12
-        self.left.linear.x = -0.12
-        self.up.linear.z = -0.12
-        self.down.linear.z = 0.12
+        self.right.linear.x = self.baseThrust
+        self.left.linear.x = -self.baseThrust
+        self.up.linear.z = -self.baseThrust * self.upwardThrustRatio
+        self.down.linear.z = self.baseThrust * self.downwardThrustRatio
 
     def resizeImage(self, ros_image):
         try:
@@ -170,14 +177,17 @@ class LineFollower:
         print "pcorr: ", pcorr
         try:
             print "pix change: ", (error - self.prev_err)
-            print "derr: ", (error - self.prev_err) / (rospy.Time.now() - self.prev_time).to_sec()
-            print "dcorr: ", self.kD * (error - self.prev_err) / (rospy.Time.now() - self.prev_time).to_sec()
-            correction = pcorr + self.kD * (error - self.prev_err) / (rospy.Time.now() - self.prev_time).to_sec()
-        except ZeroDivisionError:
-            print("dcorr: NaN no time")
+            print "time diff: ", (rospy.Time.now() - self.prev_time).to_sec()
+            dcorr = self.kD * (error - self.prev_err) / (rospy.Time.now() - self.prev_time).to_sec()
+        except ZeroDivisionError as e:
+            print e
+            dcorr = 0
+        if np.isnan(dcorr):
             correction = pcorr
+        correction = pcorr + dcorr
         self.prev_time = rospy.Time.now()
         self.prev_err = error
+        print "dcorr", dcorr
         print "correction", correction
         print 'time:', self.prev_time.to_sec()
         return correction
@@ -228,7 +238,11 @@ class LineFollower:
             if self.prev_direction[0] != 'x':
                 print 'reset err bc change to x'
                 self.prev_err = self.y_err
-            self.direction_msg.linear.z = self.correctError(self.y_err)
+            correction = self.correctError(self.y_err)
+            if np.sign(correction) > 0: #down
+                self.direction_msg.linear.z = correction * self.downwardThrustRatio
+            else:
+                self.direction_msg.linear.z = correction * self.upwardThrustRatio
         elif axis is 'y': # travel along y axis --> correct x error
             if self.prev_direction[0] != 'y':
                 print 'reset err bc change to y'
