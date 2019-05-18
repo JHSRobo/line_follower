@@ -50,11 +50,15 @@ class LineFollower:
         # left = ['x', -1]
         # top = ['y', -1]
         # bottom = ['y', 1]
+        self.curr_direction = [None, None]
         self.prev_direction = [None, None]
         self.largestColValue = 0
         self.largestRowValue = 0
+        self.contacts = []
+        self.edge = [] #important edge for finding midpoint
+
         # cropping on image for finding boundary contacts
-        self.borderWidth = 30
+        self.borderWidth = 25
 
         # preprocessing parameters
         self.height = 212
@@ -66,10 +70,9 @@ class LineFollower:
         self.isStopped = False
 
         # for ease of debug image showing
-        self.segments = []
         self.cx = 0
         self.cy = 0
-        self.longestLine = [0,0,0,0]
+        self.contours = []
 
     def resetMessages(self):
         self.right.linear.x = self.baseThrust
@@ -100,7 +103,7 @@ class LineFollower:
         # convert to hsv for better color thresholding
         hsv = cv2.cvtColor(self.img, cv2.COLOR_BGR2HSV)
         # masking image to red and not red since only those colors matter
-        # red goes around 360 (about 330 to 30) but cv sucks so its hues (and vals and saturations)go 0 to 255
+        # red goes around 360 (about 330 to 30) but cv sucks so its hues go 0 to 180
         # so we'll just say red starts at 160 and ends at 20
         # https://docs.opencv.org/3.4/de/d25/imgproc_color_conversions.html
         lower_red = np.array([160, 60, 60])
@@ -114,42 +117,26 @@ class LineFollower:
 
     # returns an array of arrays of axis ('x' or 'y') and direction (1 or -1) of boundary contacts
     def findBoundaryContacts(self):
-        height, width = self.mask.shape
-        # "crop" in to avoid occluded camera views
-        frame = self.borderWidth/2
-        height -= frame
-        width -= frame
-        contacts = []
-        right = False
-        left = False
-        for row in self.mask:
-            if row[width] > 0: # right side
-                right = True
-            if row[frame] > 0: # left side
-                left = True
-        if right:
-            contacts.append(['x', 1])
-        if left:
-            contacts.append(['x', -1])
-        if max(self.mask[height]) > 0: # bottom
-            contacts.append(['y', 1])
-        if max(self.mask[frame]) > 0: # top
-            contacts.append(['y', -1])
-        print 'contacts: ', contacts
-        return contacts
+        self.contacts = []
+        mask = self.mask[self.borderWidth:-self.borderWidth, self.borderWidth:-self.borderWidth]
+        if(np.count_nonzero(mask, axis=0)[0] > 0): #left
+            self.contacts.append(['x', -1])
+        if(np.count_nonzero(mask, axis=0)[-1] > 0): #right
+            self.contacts.append(['x', 1])
+        if(np.count_nonzero(mask, axis=1)[0] > 0): #top
+            self.contacts.append(['y', -1])
+        if(np.count_nonzero(mask, axis=1)[-1] > 0): #bottom
+            self.contacts.append(['y', 1])
+        print 'contacts: ', self.contacts
 
     # calculates whether a row or a column has more mask in it
     def calcSpread(self):
+        print 'calcspread'
         height, width = self.mask.shape
-        colSums = [0] * width
-        rowSums = []
-        for row in self.mask:
-            rowSums.append(sum(row))
-        for column in range(width):
-            for row in self.mask:
-                colSums[column] += row[column] * width / height # scale factor in case of nonsquare image
-        self.largestRowValue = max(rowSums)
-        self.largestColValue = max(colSums)
+        print np.amax(np.count_nonzero(self.mask, axis=0)) #col
+        print np.amax(np.count_nonzero(self.mask, axis=1)) #row
+        self.largestRowValue = np.amax(np.count_nonzero(self.mask, axis=1))
+        self.largestColValue = np.amax(np.count_nonzero(self.mask, axis=0)) * width / height # scale factor in case of nonsquare image
         if self.largestColValue > self.largestRowValue:
             return 'y'
         else:
@@ -159,10 +146,12 @@ class LineFollower:
     def chooseDirection(self):
         axis = self.calcSpread()
         direction = self.prev_direction[1]
+        self.findBoundaryContacts()
         if axis == self.prev_direction[0]: # no reversing
+            print 'no reverse'
             return self.prev_direction
-        contacts = self.findBoundaryContacts()
-        for contact in contacts:
+        for contact in self.contacts:
+            print 'contact: ', contact
             if contact[0] != self.prev_direction[0]:
                 direction = contact[1]
         return [axis, direction]
@@ -192,47 +181,40 @@ class LineFollower:
         print 'time:', self.prev_time.to_sec()
         return correction
 
-    def findLineDirection(self, line):
-        if abs(line[0] - line[2]) > abs(line[1] - line[3]):
-            # print 'line dir: x'
-            return 'x'
-        else:
-            # print 'line dir: y'
-            return 'y'
-
-    def calcLength(self, line):
-        # line[0] = x1
-        # line[1] = y1
-        # line[2] = x2
-        # line[3] = y2
-        return math.sqrt( ( line[0] - line[2] ) ** 2 + ( line[1] - line[3] ) ** 2 )
-
-    def calcMidpoint(self, line):
-        return (line[0] + line [2])/2, (line[1] + line[3])/2
-
-    def findLongestLine(self, axis):
-        lengths = []
-        for line in self.segments:
-            if self.findLineDirection(line[0]) == axis:
-                lengths.append(self.calcLength(line[0]))
-        index = lengths.index(max(lengths))
-        self.longestLine = self.segments[index][0]
-        print 'longest line: ', self.segments[index][0]
-        print 'length: ', max(lengths)
-        return self.segments[index][0]
+    def calcMidpoint(self):
+        _, contours, _ = cv2.findContours(self.mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+        self.contours = np.array(contours) # shape should be (1, numberOfContours, 1, 2)
+        direction = [None, None]
+        direction[0], direction[1] = self.curr_direction[0], self.curr_direction[1]
+        self.cy, self.cx = self.mask.shape[0]/2, self.mask.shape[1]/2
+        print 'contacts: ', self.curr_direction in self.contacts
+        if not self.curr_direction in self.contacts:
+            print 'check other dir'
+            direction[1] = -direction[1]
+        if direction[0] == 'x':
+            if direction[1] == -1: #left
+                self.edge = np.where(self.contours[:,:,:,0] == self.borderWidth)
+            else: #right
+                self.edge = np.where(self.contours[:,:,:,0] == self.mask.shape[1]-self.borderWidth)
+            if np.any(self.edge):
+                self.cy = abs(self.contours[self.edge][0][1]-self.contours[self.edge][-1][1])/2 + np.amin(self.contours[self.edge][:,1])
+                self.cx = self.mask.shape[0]/2
+        if direction[0] == 'y':
+            if direction[1] == -1: #top
+                self.edge = np.where(self.contours[:,:,:,1] == self.borderWidth)
+            else: #bottom
+                self.edge = np.where(self.contours[:,:,:,1] == self.mask.shape[0]-self.borderWidth)
+            if np.any(self.edge):
+                self.cx = abs(self.contours[self.edge][0][0]-self.contours[self.edge][-1][0])/2 + np.amin(self.contours[self.edge][:,0])
+                self.cy = self.mask.shape[1]/2
+        print 'midpoint: ', self.cx, self.cy
 
     def calcError(self, axis):
-        try:
-            self.cx, self.cy = self.calcMidpoint(self.findLongestLine(axis))
-        except TypeError as e:
-            print e
-            self.cx, self.cy = self.width/2, self.height/2
-        print 'cxcy', self.cx, self.cy
+        self.calcMidpoint()
         self.x_err = self.cx - (self.width/2)
         self.y_err = self.cy - (self.height/2)
 
     def keepCentered(self, axis):
-        self.segments = cv2.HoughLinesP(self.mask, 5, math.pi/180, 50)
         self.calcError(axis)
         if axis is 'x': # travel along x axis --> correct y error
             if self.prev_direction[0] != 'x':
@@ -254,17 +236,16 @@ class LineFollower:
         cv2.imshow("resized", self.img)
         cv2.imshow("mask", self.mask)
         centroid = cv2.bitwise_and(self.img,self.img, mask= self.mask)
-        lineColor = (255, 0, 0)
-        line = self.longestLine
-        cv2.line(centroid, (line[0], line[1]), (line[2], line[3]), lineColor, 1, 8)
+        for point in self.contours[self.edge]:
+            print 'point: ', tuple(point)
+            cv2.circle(centroid, tuple(point), 3, (255,0,0), -1)
         cv2.circle(centroid,(int(self.cx), int(self.cy)), 10,(0,255,0),-1)
         cv2.imshow("centroid", centroid)
 
     def checkIsStopped(self):
         if rospy.Time.now().to_sec() > (self.start_time + self.duration):
-            contacts = self.findBoundaryContacts()
             numContacts = 0
-            for contact in contacts:
+            for contact in self.contacts:
                 numContacts += 1
             if numContacts < 2:
                 self.isStopped = True
@@ -278,24 +259,23 @@ class LineFollower:
             # preprocessing
             self.resizeImage(data)
             self.maskImage()
-
             # cardinal direction
-            direction = self.chooseDirection()
-            print 'direction: ', direction
+            self.curr_direction = self.chooseDirection()
+            print 'direction: ', self.curr_direction
             print 'longest row: ', self.largestRowValue
             print 'longest col: ', self.largestColValue
-            self.direction_msg = self.makeDirectionMessage(direction)
+            self.direction_msg = self.makeDirectionMessage(self.curr_direction)
 
             # error correction
-            self.keepCentered(direction[0])
+            self.keepCentered(self.curr_direction[0])
 
             # debug image
-            self.showDebugImages(direction[0])
+            self.showDebugImages(self.curr_direction[0])
             cv2.waitKey(1)
 
             self.pub.publish(self.direction_msg)
             self.checkIsStopped()
-            self.prev_direction = direction # update direction
+            self.prev_direction = self.curr_direction # update direction
         else:
             self.pub.publish(self.stop)
 def main():
