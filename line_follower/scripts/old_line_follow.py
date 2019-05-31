@@ -1,3 +1,8 @@
+"""
+Group: Software Department, Rovotics, Jesuit High School
+Time: May 20, 2019
+Description: Software for inspecting dam transect line as part of mission task 1
+"""
 #!/usr/bin/env python
 import roslib
 import rospy
@@ -7,200 +12,169 @@ import math
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Image
-import functools
-from skimage import morphology
 
 class LineFollower:
     def __init__(self):
         self.bridge = CvBridge()
-        # figure out the video feed
-        # delayed sim feed
-        # 0.3 seconds * 30 frames / second = 9 frame buffer
-        self.image_sub = rospy.Subscriber("/rov/camera1/image_raw", Image, self.camera_callback, queue_size=9)
-        # sim feed
-        #self.image_sub = rospy.Subscriber("/rov/camera1/image_raw", Image, self.camera_callback)
-        # real feed
-        #self.image_sub = rospy.Subscriber("/rov/image_raw", Image, self.camera_callback)
-        self.movement_pub = rospy.Publisher("/rov/cmd_vel", Twist, queue_size=0)
-        # dictionary of 4 cardinal directions and one stop for line follow task
+        self.image_sub = rospy.Subscriber("/rov/image_raw", Image, self.camera_callback)
+        self.pub = rospy.Publisher("/rov/cmd_vel", Twist, queue_size=0)
+
+        # Main direction messages
         self.right = Twist()
         self.left = Twist()
         self.up = Twist()
         self.down = Twist()
         self.stop = Twist()
 
-        self.right.linear.x = 0.11
-        self.left.linear.x = -0.11
-        self.up.linear.z = -0.156
-        self.down.linear.z = 0.156
+        # rough relationship between horizontal and vertical thrust
+        # as well as forward and back
+        self.baseThrust = 0.15
+        self.reverseConstant = 1.5 # forward thrust is about 1.5x as powerful as reverse with the same cmd_vel
+        self.upwardThrustRatio = math.sqrt(2) + (1/self.reverseConstant) * math.sqrt(2)
+        self.downwardThrustRatio = math.sqrt(2) + self.reverseConstant * math.sqrt(2)
 
-        self.corrected_msg = Twist()
-        # for deciding orientation of line
-        self.longestLine = [0, 0, 0, 0]
+        # for picking which direction message to use
         # axes of an image increase left to right and bottom to top
+        self.prev_contacts = []
         self.y_directions = {1 : self.down, -1 : self.up}
         self.x_directions = {1 : self.right, -1 : self.left}
         self.axes = {'x' : self.x_directions, 'y' : self.y_directions, 'stop' : self.stop}
         self.direction_msg = Twist()
-        # first value is the axis and the second is the direction
-        self.prev_direction =['', '']
 
-        self.y_err = 0
-        self.x_err = 0
-        self.err = 0
-        self.err_axis = ''
-        # for PD (no integral)
+        # for software PD controller (no integral)
         self.prev_err = 0
         self.prev_time = rospy.Time.now()
         self.kP = 0.003
         self.kD = 0.002
+        self.longestLine = [0, 0, 0, 0]
+
+        # for choosing directions
+        # [axis ('x' or 'y'), direction (1 or -1)]
+        # right = ['x', 1]
+        # left = ['x', -1]
+        # top = ['y', -1]
+        # bottom = ['y', 1]
+        self.curr_direction = [None, None]
+        self.prev_direction = [None, None]
+        self.contacts = []
+
+        # cropping on image for finding boundary contacts
+        self.borderWidth = 25
+
+        # preprocessing parameters
         self.height = 212
         self.width = 212
-        self.cx, self.cy = self.width/2, self.height/2
 
+        # for deciding when to end line following
+        self.start_time = rospy.Time.now().to_sec()
+        self.duration = 45 # in seconds
+        self.isStopped = False
 
-    def makeDirectionMessage(self, error, axis):
-        msg = Twist()
-        if error == 0:
-            error = self.prev_direction[1]
-        if axis != 'x' and axis != 'y':
-            print 'old'
-            axis = self.prev_direction[0]
-        if axis == 'x':
-            if error < 0:
-                print 'left'
-                msg.linear.x = -0.11
-            elif error > 0:
-                print 'right'
-                msg.linear.x = 0.11
-        elif axis == 'y':
-            if error < 0:
-                print 'up'
-                msg.linear.z = -0.156
-            elif error > 0:
-                print 'down'
-                msg.linear.z = 0.156
-        return msg
-
-    # funky PD controller
-    # a lil extra jank in P control to get over the deadzone
-    # https://www.desmos.com/calculator/djlykzatim
-    def correctError(self, error):
-        correction = 0
-        #pcorr = np.sign(error) * (0.00645 + (abs(error) ** 0.56) / 43.942)
-        pcorr = self.kP * error
-        try:
-            print("derr: ", (error - self.prev_err))
-            print("dcorr: ", self.kD * (error - self.prev_err) / (rospy.Time.now() - self.prev_time).to_sec())
-            correction = pcorr + self.kD * (error - self.prev_err) / (rospy.Time.now() - self.prev_time).to_sec()
-        except ZeroDivisionError:
-            print("dcorr: NaN no time")
-            correction = pcorr
-        self.prev_time = rospy.Time.now()
-        self.prev_err = error
-        print("pcorr: ", pcorr)
-        print("correction", correction)
-        print('time:', self.prev_time)
-        return correction
-
-    def calcSpread(self, img):
-        height, width = img.shape
-        colSums = [0] * width
-        rowSums = []
-        for row in img:
-            rowSums.append(sum(row))
-        for column in range(width):
-            for row in img:
-                colSums[column] += row[column]
-        self.largestRowValue = max(rowSums)
-        self.largestColValue = max(colSums)
-
-    def keepCentered(self, error, axis):
-        print("error", error)
-        self.corrected_msg = self.direction_msg
-        if axis is 'x':
-            if self.prev_direction[0] != 'y':
-                print 'reset err bc not y'
-                self.prev_err = error
-            self.corrected_msg.linear.x = self.correctError(error)
-        elif axis is 'y':
-            if self.prev_direction[0] != 'x':
-                print 'reset err bc not x'
-                self.prev_err = error
-            self.corrected_msg.linear.z = self.correctError(error)
-        return self.corrected_msg
-
-    def findBoundaryContacts(self, axis, img):
-        height, width = img.shape
-        #weird stuff on the bottom of camera view that blocks it
-        height -= 15
-        width -= 1
-        if axis == 'x':
-            columnArr = [0,0]
-            for row in img:
-                if row[width] > 0: # right side
-                    columnArr[1] = 1
-                elif row[0] > 0: # left side
-                    columnArr[0] = 1
-            if columnArr[0] == columnArr[1]:
-                return 0
-            elif columnArr[0] > columnArr[1]:
-                return -1
-            elif columnArr[1] > columnArr[0]:
-                return 1
-            else:
-                return 0
-        elif axis == 'y':
-            if max(img[height]) == max(img[0]):
-                return 0
-            elif max(img[height]) > 0:
-                return 1
-            elif max(img[0]) > 0:
-                return -1
-            else:
-                return 0
-        else:
-            print 'default'
-            return 0
+        # for ease of debug image showing
+        self.cx = 0
+        self.cy = 0
 
     def resetMessages(self):
-        self.right = Twist()
-        self.left = Twist()
-        self.up = Twist()
-        self.down = Twist()
-        self.stop = Twist()
+        self.right.linear.x = self.baseThrust
+        self.left.linear.x = -self.baseThrust
+        self.up.linear.z = -self.baseThrust * self.upwardThrustRatio
+        self.down.linear.z = self.baseThrust * self.downwardThrustRatio
 
-        self.right.linear.x = 0.11
-        self.left.linear.x = -0.11
-        self.up.linear.z = -0.156
-        self.down.linear.z = 0.156
+    def resizeImage(self, ros_image):
+        try:
+            # converting from ROS default rgb8 encoding to CV's standard bgr8 encoding
+            image = self.bridge.imgmsg_to_cv2(ros_image, "bgr8")
+        except CvBridgeError as e:
+            print(e)
+        # downsampling to 212 x 212 to speed things up
+        img_height, img_width, channels = image.shape
+        newsize = (self.width, self.height)
+        interpolation = cv2.INTER_NEAREST
+        # square crop
+        cropped_img = image[0:img_height, (img_width - img_height)/2:(img_width + img_height)/2]
+        self.img = cv2.resize(cropped_img, newsize, 0, 0, interpolation)
 
-    def updateDirection(self, axis, mask):
-        if axis == 'y':
-            self.prev_direction = ['x', self.findBoundaryContacts('x', mask)]
-        elif axis == 'x':
-            self.prev_direction = ['y', self.findBoundaryContacts('y', mask)]
 
-    def findLongestLine(self, lines, axis):
+    def maskImage(self):
+        # convert to YCbCr for better color thresholding
+        Y, Cr, Cb = cv2.split(cv2.cvtColor(self.img, cv2.COLOR_BGR2YCrCb))
+        gamma_mask = cv2.adaptiveThreshold(Y, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV,self.width-1,20)
+        red_mask = cv2.adaptiveThreshold(Cr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,self.width-1,-10)
+        mask = cv2.bitwise_and(gamma_mask, red_mask)
+        kernel = np.ones((3,3),np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        self.mask = mask
+
+    # returns an array of arrays of axis ('x' or 'y') and direction (1 or -1) of boundary contacts
+    def findBoundaryContacts(self):
+        self.contacts = []
+        mask = self.mask[self.borderWidth:-self.borderWidth, self.borderWidth:-self.borderWidth]
+        if(np.count_nonzero(mask, axis=0)[0] > 0): #left
+            self.contacts.append(['x', -1])
+        if(np.count_nonzero(mask, axis=0)[-1] > 0): #right
+            self.contacts.append(['x', 1])
+        if(np.count_nonzero(mask, axis=1)[0] > 0): #top
+            self.contacts.append(['y', -1])
+        if(np.count_nonzero(mask, axis=1)[-1] > 0): #bottom
+            self.contacts.append(['y', 1])
+
+    # choose direction based off of spread, boundary contacts, and previous direction
+    def chooseDirection(self):
+        self.findBoundaryContacts()
+        for contact in self.contacts:
+            if contact not in self.prev_contacts:
+                if contact[0] != self.prev_direction[0]:
+                    return contact
+                else:
+                    return self.prev_direction
+            else:
+                return self.prev_direction
+        return self.prev_direction
+
+    def makeDirectionMessage(self, direction):
+        return self.axes.get(direction[0], self.stop).get(direction[1], self.stop)
+
+    def correctError(self, error):
+        correction = 0
+        pcorr = self.kP * error
+        print 'perr: ', error
+        print "pcorr: ", pcorr
+        try:
+            print "pix change: ", (error - self.prev_err)
+            print "time diff: ", (rospy.Time.now() - self.prev_time).to_sec()
+            dcorr = self.kD * (error - self.prev_err) / (rospy.Time.now() - self.prev_time).to_sec()
+        except ZeroDivisionError as e:
+            print e
+            dcorr = 0
+        if np.isnan(dcorr):
+            correction = pcorr
+        correction = pcorr + dcorr
+        self.prev_time = rospy.Time.now()
+        self.prev_err = error
+        print "dcorr", dcorr
+        print "correction", correction
+        print 'time:', self.prev_time.to_sec()
+        return correction
+
+    def findLongestLine(self):
         lengths = []
-        print 'here'
-        print 'line dir: ', axis
-        for line in lines:
-            if self.findLineDirection(line[0]) == axis:
+        for line in self.segments:
+            if self.findLineDirection(line[0]) == self.curr_direction[0]:
                 lengths.append(self.calcLength(line[0]))
         index = lengths.index(max(lengths))
-        self.longestLine = lines[index][0]
-        print 'longest line: ', lines[index][0]
-        print 'length: ', max(lengths)
-        return lines[index][0]
+        self.longestLine = self.segments[index][0]
+        print 'longest line: ', self.longestLine
+        print 'length: ', self.calcLength(self.longestLine)
+        return self.segments[index][0]
 
     def findLineDirection(self, line):
-        if abs(line[0] - line[2]) > abs(line[1] - line[3]):
-            # print 'line dir: x'
+        if abs(line[0] - line[2]) < 10:
             return 'x'
-        else:
-            # print 'line dir: y'
+        elif abs(line[1] - line[3]) < 10:
             return 'y'
+        else:
+            return 'neither'
+
     def calcLength(self, line):
         # line[0] = x1
         # line[1] = y1
@@ -208,144 +182,82 @@ class LineFollower:
         # line[3] = y2
         return math.sqrt( ( line[0] - line[2] ) ** 2 + ( line[1] - line[3] ) ** 2 )
 
-    def calcMidpoint(self, line):
-        print 'midpoint:', (line[0] + line [2])/2, (line[1] + line[3])/2
-        return (line[0] + line [2])/2, (line[1] + line[3])/2
+    def calcMidpoint(self):
+        self.segments = cv2.HoughLinesP(self.mask, 5, math.pi/180, 50)
+        self.findLongestLine()
+        self.cx, self.cy = (self.longestLine[0] + self.longestLine[2])/2, (self.longestLine[1] + self.longestLine[3])/2
+        print 'midpoint:', self.cx, self.cy
 
-    def calcError(self, lines, axis):
-        try:
-            self.cx, self.cy = self.calcMidpoint(self.findLongestLine(lines, axis))
-        except TypeError as e:
-            print e
-            self.cx, self.cy = self.width/2, self.height/2
-        print 'cxcy', self.cx, self.cy
+    def calcError(self):
+        self.calcMidpoint()
         self.x_err = self.cx - (self.width/2)
         self.y_err = self.cy - (self.height/2)
 
-    # 200 ms delay to simulate analog conversion delay
-    def delay_callback(self, msg):
-        timer = rospy.Timer(rospy.Duration(0.2), functools.partial(self.camera_callback, msg), oneshot=True)
+    def keepCentered(self, axis):
+        self.calcError()
+        if axis is 'x': # travel along x axis --> correct y error
+            if self.prev_direction[0] != 'x':
+                print 'reset err bc change to x'
+                self.prev_err = self.y_err
+            correction = self.correctError(self.y_err)
+            if np.sign(correction) > 0: #down
+                self.direction_msg.linear.z = correction * self.downwardThrustRatio
+            else:
+                self.direction_msg.linear.z = correction * self.upwardThrustRatio
+        elif axis is 'y': # travel along y axis --> correct x error
+            if self.prev_direction[0] != 'y':
+                print 'reset err bc change to y'
+                self.prev_err = self.x_err
+            self.direction_msg.linear.x = self.correctError(self.x_err)
+
+
+    def showDebugImages(self, axis):
+        cv2.imshow("resized", self.img)
+        cv2.imshow("mask", self.mask)
+        centroid = cv2.bitwise_and(self.img,self.img, mask= self.mask)
+        lineColor = (255, 0, 0)
+        cv2.line(centroid, (self.longestLine[0], self.longestLine[1]), (self.longestLine[2], self.longestLine[3]), lineColor, 1, 8)
+        cv2.circle(centroid,(int(self.cx), int(self.cy)), 10,(0,255,0),-1)
+        cv2.imshow("centroid", centroid)
+
+    def checkIsStopped(self):
+        if rospy.Time.now().to_sec() > (self.start_time + self.duration):
+            if len(self.contacts) < 2:
+                self.isStopped = True
+            else:
+                self.isStopped = False
 
     def camera_callback(self, data):
-        try:
-            # converting from ROS default rgb8 encoding to CV's standard bgr8 encoding
-            image = self.bridge.imgmsg_to_cv2(data, "bgr8")
-        except CvBridgeError as e:
-            print(e)
-        # downsampling to 212 x 160 to speed things up
-        img_height, img_width, channels = image.shape
-        newsize = (self.width, self.height)
-        interpolation = cv2.INTER_NEAREST
-        cropped_img = image
-        # square crop
-        cropped_img = image[0:img_height, (img_width - img_height)/2:(img_width + img_height)/2]
-        # cropping image to one half because sim cam has something blocking it
-        #cropped_img = image[int(math.floor((img_height - img_height/1.5)/2)):int(math.ceil((img_height + img_height/1.5)/2)), int(math.floor((img_width - img_width/1.5)/2)):int(math.ceil((img_width + img_width/1.5)/2))]
-        resized_img = cv2.resize(cropped_img, newsize, 0, 0, interpolation)
-
-        # convert to hsv for better color thresholding
-        hsv = cv2.cvtColor(resized_img, cv2.COLOR_BGR2HSV)
-
-        # masking image to red and not red since only those colors matter
-        # red goes around 360 (about 330 to 30) but cv sucks so its hues (and vals and saturations)go 0 to 255
-        # so we'll just say red starts at 160 and ends at 20
-        # https://docs.opencv.org/3.4/de/d25/imgproc_color_conversions.html
-        lower_red = np.array([160, 60, 60])
-        inbw_red1 = np.array([255, 255, 255])
-        inbw_red2 = np.array([0, 60, 60])
-        upper_red = np.array([20, 255, 255])
-        mask1 = cv2.inRange(hsv, lower_red, inbw_red1)
-        mask2 = cv2.inRange(hsv, inbw_red2, upper_red)
-        mask = mask1 + mask2
-        # find centroid which will be used to keep line-following on track
-        # and decide when to change direction and what direction to change to
-
-        skeleton = morphology.skeletonize(mask/255).astype(np.uint8)
-        segments = cv2.HoughLinesP(mask, 5, math.pi/180, 50)
-        #for debug
-        #cv2.imshow("original", image)
-        cv2.imshow("resized", resized_img)
-        cv2.imshow("mask", mask)
-        centroid = cv2.bitwise_and(resized_img,resized_img, mask= mask)
-        cv2.circle(centroid,(int(self.cx), int(self.cy)), 10,(0,255,0),-1)
-        cv2.imshow('skeleton', skeleton*255)
-        lineColor = (255, 0, 0)
-        try:
-            for line in segments:
-                line = line[0]
-                #print line
-                cv2.line(centroid, (line[0], line[1]), (line[2], line[3]), lineColor, 1, 8)
-        except TypeError as e:
-            print e
-            print 'no lines'
-        cv2.imshow("centroid", centroid)
-        cv2.waitKey(1)
-
-
-
-
-
-        # update axis of direction
-        self.calcSpread(mask)
-
-        # TODO sanity check this direction choosing
-        if self.prev_direction[0] != 'x' and self.prev_direction[0] != 'y':
-            if self.largestColValue > self.largestRowValue:
-                # gotta start with least amount of line in frame
-                print('y choose')
-                self.direction_msg = self.makeDirectionMessage(self.findBoundaryContacts('y', mask), 'y')
-                # error to correct
-                self.calcError(segments, 'y')
-                self.err = self.x_err
-                self.err_axis = 'x'
-            else:
-                # gotta start with least amount of line in frame
-                print('x choose')
-                self.direction_msg = self.makeDirectionMessage(self.findBoundaryContacts('x', mask), 'x')
-                # error to correct
-                self.calcError(segments, 'x')
-                self.err = self.y_err
-                self.err_axis = 'y'
-        elif self.prev_direction[0] == 'x':
-            # error to correct
-            self.calcError(segments, 'x')
-            self.err = self.y_err
-            self.err_axis = 'y'
-            # changing direction
-            if self.largestColValue > self.largestRowValue:
-                # gotta start with least amount of line in frame
-                print('y choose in x')
-                self.direction_msg = self.makeDirectionMessage(self.findBoundaryContacts('y', mask), 'y')
-                # error to correct
-                self.calcError(segments, 'y')
-                self.err = self.x_err
-                self.err_axis = 'x'
-        elif self.prev_direction[0] == 'y':
-            # error to correct
-            self.calcError(segments, 'y')
-            self.err = self.x_err
-            self.err_axis = 'x'
-            # changing direction
-            if self.largestRowValue > self.largestColValue:
-                # gotta start with least amount of line in frame
-                print('x choose in y')
-                print 'test: ', self.findBoundaryContacts('x', mask)
-                self.direction_msg = self.makeDirectionMessage(self.findBoundaryContacts('x', mask), 'x')
-                # error to correct
-                self.calcError(segments, 'x')
-                self.err = self.y_err
-                self.err_axis = 'y'
-        # error correction
-        self.movement_pub.publish(self.keepCentered(self.err, self.err_axis))
+        print '-----======== start callback ========-----'
         self.resetMessages()
-        self.updateDirection(self.err_axis, mask)
+        if not self.isStopped:
+            # preprocessing
+            self.resizeImage(data)
+            self.maskImage()
+            # cardinal direction
+            self.curr_direction = self.chooseDirection()
+            print 'direction: ', self.curr_direction
+            print 'contacts: ', self.contacts
+            print 'prev conts: ', self.prev_contacts
+            self.direction_msg = self.makeDirectionMessage(self.curr_direction)
+
+            # error correction
+            self.keepCentered(self.curr_direction[0])
+
+            # debug image
+            self.showDebugImages(self.curr_direction[0])
+            cv2.waitKey(1)
+
+            self.pub.publish(self.direction_msg)
+            self.checkIsStopped()
+            self.prev_contacts = self.contacts
+            self.prev_direction = self.curr_direction # update direction
+        else:
+            self.pub.publish(self.stop)
 def main():
     rospy.init_node('line_follower')
     line_follower_object = LineFollower()
     rospy.spin()
-
-
-
 
 if __name__ == '__main__':
     main()
